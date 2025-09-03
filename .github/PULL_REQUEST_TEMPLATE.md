@@ -1,6 +1,9 @@
 ## 📌 Descrição
 Explique resumidamente o que foi feito.
 
+## 🏷️ Issue
+- Link da issue relacionada (opcional)
+
 ## 🔍 Motivo
 Qual problema/necessidade este PR resolve?
 
@@ -13,9 +16,6 @@ De forma breve, adicione uma lista de modificações
 - [ ] Documentação
 - [ ] Testes
 - [ ] Configuração/Infra
-
-## 🏷️ Issue
-- Link da issue relacionada (opcional)
 
 ## 👥 Responsável
 Um ou mais responsáveis pelas mudanças. Aqui não necessariamente é o revisor ou desenvolvedor, mas quem procurar caso haja necessidade.
