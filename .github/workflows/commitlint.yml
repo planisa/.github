@@ -7,9 +7,6 @@ on:
         description: Caminho do arquivo de config do commitlint (opcional)
         required: false
         type: string
-    secrets:
-      GITHUB_TOKEN:
-        required: false
 
 jobs:
   commitlint:
@@ -18,7 +15,7 @@ jobs:
       contents: read
       pull-requests: read
     steps:
-      - name: Checkout do repositório solicitante
+      - name: Checkout do repositório chamador
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -26,5 +23,4 @@ jobs:
       - name: Lint commits com commitlint
         uses: wagoid/commitlint-github-action@v6
         with:
-          # Se o repo solicitante tiver um arquivo diferente do padrão
           configFile: ${{ inputs.configFile }}
