@@ -1,0 +1,30 @@
+name: Reusable - Commitlint
+
+on:
+  workflow_call:
+    inputs:
+      configFile:
+        description: Caminho do arquivo de config do commitlint (opcional)
+        required: false
+        type: string
+    secrets:
+      GITHUB_TOKEN:
+        required: false
+
+jobs:
+  commitlint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout do repositório solicitante
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Lint commits com commitlint
+        uses: wagoid/commitlint-github-action@v6
+        with:
+          # Se o repo solicitante tiver um arquivo diferente do padrão
+          configFile: ${{ inputs.configFile }}
