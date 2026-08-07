@@ -1,0 +1,202 @@
+name: Security Full Scan
+
+# Workflow reutilizável: varredura completa do repositório, para acompanhar a dívida
+# de segurança que o gate de PR não enxerga.
+#
+# O security-pr.yml é diff-only por design — só avalia código novo, para não travar
+# PRs em achado pré-existente. A consequência é que o código que já estava no
+# repositório nunca é varrido. Este workflow cobre essa lacuna: roda agendado, nunca
+# reprova nada, e concentra o resultado em uma issue única atualizada a cada execução.
+
+on:
+  workflow_call:
+    inputs:
+      semgrep-config:
+        description: Rulesets do Semgrep, separados por espaço.
+        type: string
+        default: p/default p/owasp-top-ten p/gitleaks
+      semgrep-version:
+        description: Versão exata do pacote semgrep instalada no runner.
+        type: string
+        default: 1.172.0
+      exclude:
+        description: Paths adicionais ignorados na varredura, separados por espaço.
+        type: string
+        default: ''
+      issue-label:
+        description: Label que identifica a issue de acompanhamento.
+        type: string
+        default: divida-semgrep
+      max-findings-in-issue:
+        description: Máximo de findings ERROR listados no corpo da issue.
+        type: number
+        default: 50
+
+jobs:
+  semgrep-full:
+    name: Semgrep (varredura completa)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    concurrency:
+      group: semgrep-full-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      ISSUE_MARKER: '<!-- planisa-security-full-scan:semgrep -->'
+      SEMGREP_CONFIG: ${{ inputs.semgrep-config }}
+      SEMGREP_VERSION: ${{ inputs.semgrep-version }}
+      EXCLUDE: ${{ inputs.exclude }}
+      ISSUE_LABEL: ${{ inputs.issue-label }}
+      MAX_FINDINGS: ${{ inputs.max-findings-in-issue }}
+
+    steps:
+      - name: Validar inputs
+        run: |
+          set -euo pipefail
+          # Os inputs viram argumentos de linha de comando (pip install, flags do semgrep).
+          # Restringir o alfabeto evita que um caller injete pacote ou flag arbitrária.
+          [[ "$SEMGREP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "::error::semgrep-version inválida: $SEMGREP_VERSION"; exit 1; }
+          [[ "$ISSUE_LABEL" =~ ^[A-Za-z0-9._-]+$ ]] \
+            || { echo "::error::issue-label inválida: $ISSUE_LABEL"; exit 1; }
+          [[ "$MAX_FINDINGS" =~ ^[0-9]+$ && "$MAX_FINDINGS" -ge 1 ]] \
+            || { echo "::error::max-findings-in-issue inválido: $MAX_FINDINGS"; exit 1; }
+          for token in $SEMGREP_CONFIG $EXCLUDE; do
+            [[ "$token" =~ ^[A-Za-z0-9._/*-]+$ ]] \
+              || { echo "::error::token inválido em semgrep-config/exclude: $token"; exit 1; }
+          done
+          [ -n "${SEMGREP_CONFIG// /}" ] || { echo "::error::semgrep-config vazio"; exit 1; }
+
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+        with:
+          persist-credentials: false
+
+      - name: Configurar Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Instalar Semgrep
+        run: pip install --disable-pip-version-check "semgrep==$SEMGREP_VERSION"
+
+      - name: Rodar Semgrep no repositório inteiro
+        run: |
+          set -uo pipefail
+          config_args=()
+          for c in $SEMGREP_CONFIG; do config_args+=(--config "$c"); done
+          exclude_args=()
+          for e in $EXCLUDE; do exclude_args+=(--exclude "$e"); done
+
+          set +e
+          semgrep scan \
+            "${config_args[@]}" \
+            "${exclude_args[@]}" \
+            --metrics=off \
+            --quiet \
+            --json --output semgrep.json
+          semgrep_status=$?
+          set -e
+          # Exit 1 = findings; 2/3/4/7 = config ou regra inválida, aí o job precisa quebrar.
+          if [ "$semgrep_status" -gt 1 ]; then
+            echo "::error::semgrep terminou com erro (exit $semgrep_status)"
+            exit "$semgrep_status"
+          fi
+          if [ ! -s semgrep.json ]; then
+            echo "::error::semgrep não produziu semgrep.json"
+            exit 1
+          fi
+
+          echo "Findings (lista completa):"
+          jq -r '.results[] | "  [\(.extra.severity)] \(.path):\(.start.line) \(.check_id)"' semgrep.json
+          echo "Total: $(jq '.results | length' semgrep.json)"
+
+      - name: Montar corpo da issue
+        run: |
+          set -euo pipefail
+          total=$(jq '.results | length' semgrep.json)
+          errors=$(jq '[.results[] | select(.extra.severity == "ERROR")] | length' semgrep.json)
+          warnings=$(jq '[.results[] | select(.extra.severity == "WARNING")] | length' semgrep.json)
+          infos=$(jq '[.results[] | select(.extra.severity == "INFO")] | length' semgrep.json)
+          echo "TOTAL_FINDINGS=$total" >> "$GITHUB_ENV"
+
+          {
+            printf '%s\n' "$ISSUE_MARKER"
+            printf 'Varredura completa do repositório em `%s`, commit `%s`.\n' \
+              "$(date -u '+%Y-%m-%d %H:%M UTC')" "${GITHUB_SHA:0:7}"
+            printf 'Esta issue é reescrita a cada execução — o conteúdo reflete sempre a última varredura.\n\n'
+            printf '**Total %s** — `ERROR` %s &middot; `WARNING` %s &middot; `INFO` %s\n\n' \
+              "$total" "$errors" "$warnings" "$infos"
+
+            if [ "$total" -gt 0 ]; then
+              printf '### Regras mais recorrentes\n\n'
+              printf '| Severidade | Regra | Ocorrências |\n|---|---|---|\n'
+              jq -r '
+                [.results[] | {sev: .extra.severity, rule: (.check_id | split(".") | last)}]
+                | group_by(.rule)
+                | map({rule: .[0].rule, sev: .[0].sev, n: length})
+                | sort_by(-.n)
+                | .[0:15]
+                | map("| " + .sev + " | `" + .rule + "` | " + (.n | tostring) + " |")
+                | join("\n")
+              ' semgrep.json
+              printf '\n'
+            fi
+
+            if [ "$errors" -gt 0 ]; then
+              printf '\n### Findings de severidade ERROR\n\n'
+              jq -r --argjson max "$MAX_FINDINGS" '
+                [.results[] | select(.extra.severity == "ERROR")]
+                | .[0:$max]
+                | map("- `" + .path + ":" + (.start.line | tostring) + "` — `"
+                      + (.check_id | split(".") | last) + "`")
+                | join("\n")
+              ' semgrep.json
+              printf '\n'
+              if [ "$errors" -gt "$MAX_FINDINGS" ]; then
+                printf '\n_%s finding(s) ERROR omitido(s) além dos %s listados; o log do job e o artifact `semgrep-full-scan` trazem a lista completa._\n' \
+                  "$((errors - MAX_FINDINGS))" "$MAX_FINDINGS"
+              fi
+            fi
+
+            printf '\n<sub>Varredura informativa: não reprova PR nem bloqueia merge. O gate de código novo é o check `semgrep / Semgrep (código novo do PR)`.</sub>\n'
+          } > issue.md
+
+      - name: Criar ou atualizar issue de acompanhamento
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh label create "$ISSUE_LABEL" --color B60205 \
+            --description "Dívida de segurança apontada pela varredura completa do Semgrep" 2>/dev/null || true
+
+          number=$(gh issue list --label "$ISSUE_LABEL" --state open --limit 1 --json number --jq '.[0].number // empty')
+
+          if [ "$TOTAL_FINDINGS" -eq 0 ]; then
+            if [ -n "$number" ]; then
+              gh issue close "$number" --comment "Varredura completa não encontrou mais nenhum finding. Fechando."
+              echo "Issue #$number fechada: nenhum finding."
+            else
+              echo "Nenhum finding e nenhuma issue aberta."
+            fi
+            exit 0
+          fi
+
+          if [ -n "$number" ]; then
+            gh issue edit "$number" --body-file issue.md
+            echo "Issue #$number atualizada."
+          else
+            gh issue create --title "Dívida de segurança — varredura Semgrep" \
+              --label "$ISSUE_LABEL" --body-file issue.md
+          fi
+
+      - name: Guardar evidência da varredura
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: semgrep-full-scan
+          path: semgrep.json
+          if-no-files-found: warn
+          retention-days: 90
