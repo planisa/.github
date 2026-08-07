@@ -1,0 +1,247 @@
+name: Security PR Scan
+
+# Workflow reutilizável: varre com Semgrep OSS apenas o código introduzido pelo PR
+# e publica o resultado como comentário fixo no próprio PR.
+#
+# O upload SARIF para o GitHub Code Scanning não é usado de propósito: em repositório
+# privado a API de code scanning exige GitHub Advanced Security, que a organização não
+# possui. O comentário no PR mais o status check cobrem o mesmo papel sem custo.
+
+on:
+  workflow_call:
+    inputs:
+      semgrep-config:
+        description: Rulesets do Semgrep, separados por espaço.
+        type: string
+        # p/default sozinho perde hash fraco e segredo hardcoded; owasp-top-ten e
+        # gitleaks fecham essas lacunas e são gratuitos no registry público.
+        # p/secrets NÃO entra aqui: no OSS ele resolve com 0 regras (é produto Pro).
+        default: p/default p/owasp-top-ten p/gitleaks
+      semgrep-version:
+        description: Versão exata do pacote semgrep instalada no runner.
+        type: string
+        default: 1.172.0
+      exclude:
+        description: Paths adicionais ignorados na varredura, separados por espaço.
+        type: string
+        default: ''
+      fail-on-severity:
+        description: 'Severidade que reprova o check: ERROR, WARNING ou NONE.'
+        type: string
+        default: ERROR
+      max-findings-in-comment:
+        description: Máximo de findings listados no comentário do PR.
+        type: number
+        default: 25
+
+jobs:
+  semgrep-diff:
+    name: Semgrep (código novo do PR)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    # Repositório privado consome minutos pagos de Actions: push seguido no mesmo PR
+    # cancela a varredura anterior em vez de rodar as duas.
+    concurrency:
+      group: semgrep-pr-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    env:
+      COMMENT_MARKER: '<!-- planisa-security-pr-scan:semgrep -->'
+      SEMGREP_CONFIG: ${{ inputs.semgrep-config }}
+      SEMGREP_VERSION: ${{ inputs.semgrep-version }}
+      EXCLUDE: ${{ inputs.exclude }}
+      FAIL_ON: ${{ inputs.fail-on-severity }}
+      MAX_FINDINGS: ${{ inputs.max-findings-in-comment }}
+
+    steps:
+      - name: Validar inputs
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          # Todo o fluxo depende do payload de pull_request (base.sha, número do PR).
+          # Chamado de push ou schedule, falharia adiante com erro obscuro do git.
+          [ "$EVENT_NAME" = "pull_request" ] \
+            || { echo "::error::este workflow só suporta o evento pull_request (recebido: $EVENT_NAME)"; exit 1; }
+
+          # Os inputs viram argumentos de linha de comando (pip install, flags do semgrep).
+          # Restringir o alfabeto evita que um caller injete pacote ou flag arbitrária.
+          [[ "$SEMGREP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "::error::semgrep-version inválida: $SEMGREP_VERSION"; exit 1; }
+          [[ "$FAIL_ON" =~ ^(ERROR|WARNING|NONE)$ ]] \
+            || { echo "::error::fail-on-severity inválida: $FAIL_ON"; exit 1; }
+          [[ "$MAX_FINDINGS" =~ ^[0-9]+$ && "$MAX_FINDINGS" -ge 1 ]] \
+            || { echo "::error::max-findings-in-comment inválido: $MAX_FINDINGS"; exit 1; }
+          for token in $SEMGREP_CONFIG $EXCLUDE; do
+            [[ "$token" =~ ^[A-Za-z0-9._/*-]+$ ]] \
+              || { echo "::error::token inválido em semgrep-config/exclude: $token"; exit 1; }
+          done
+          [ -n "${SEMGREP_CONFIG// /}" ] || { echo "::error::semgrep-config vazio"; exit 1; }
+
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+        with:
+          # --baseline-commit precisa do histórico completo para resolver o merge-base.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configurar Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Instalar Semgrep
+        run: pip install --disable-pip-version-check "semgrep==$SEMGREP_VERSION"
+
+      - name: Determinar baseline do PR
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # Nada de `git fetch` aqui: com persist-credentials: false o runner não guarda
+          # credencial e o fetch falharia em repositório privado. No evento pull_request
+          # o checkout é o merge commit, cujo primeiro pai é a ponta da base branch —
+          # fallback confiável e offline quando base.sha não está no histórico local.
+          baseline="$(git merge-base "$BASE_SHA" HEAD 2>/dev/null || git rev-parse HEAD^1)"
+          echo "BASELINE_SHA=$baseline" >> "$GITHUB_ENV"
+          echo "Baseline: $baseline"
+
+      - name: Rodar Semgrep no diff
+        run: |
+          set -uo pipefail
+          config_args=()
+          for c in $SEMGREP_CONFIG; do config_args+=(--config "$c"); done
+          exclude_args=()
+          for e in $EXCLUDE; do exclude_args+=(--exclude "$e"); done
+
+          # metrics=off: nada sai do runner. O Semgrep OSS analisa localmente; só as
+          # regras são baixadas do registry público.
+          # O shell padrão do Actions roda com -e; o exit code do semgrep é tratado aqui.
+          set +e
+          semgrep scan \
+            "${config_args[@]}" \
+            "${exclude_args[@]}" \
+            --baseline-commit "$BASELINE_SHA" \
+            --metrics=off \
+            --quiet \
+            --json --output semgrep.json
+          semgrep_status=$?
+          set -e
+          # Exit 1 = findings; 2/3/4/7 = config ou regra inválida, aí o job precisa quebrar.
+          if [ "$semgrep_status" -gt 1 ]; then
+            echo "::error::semgrep terminou com erro (exit $semgrep_status)"
+            exit "$semgrep_status"
+          fi
+          if [ ! -s semgrep.json ]; then
+            echo "::error::semgrep não produziu semgrep.json"
+            exit 1
+          fi
+
+          # Lista completa no log: o comentário do PR é truncado, o log não.
+          echo "Findings (lista completa):"
+          jq -r '.results[] | "  [\(.extra.severity)] \(.path):\(.start.line) \(.check_id)"' semgrep.json
+          echo "Total: $(jq '.results | length' semgrep.json)"
+
+      - name: Montar relatório
+        run: |
+          set -euo pipefail
+          total=$(jq '.results | length' semgrep.json)
+          errors=$(jq '[.results[] | select(.extra.severity == "ERROR")] | length' semgrep.json)
+          warnings=$(jq '[.results[] | select(.extra.severity == "WARNING")] | length' semgrep.json)
+          infos=$(jq '[.results[] | select(.extra.severity == "INFO")] | length' semgrep.json)
+
+          {
+            printf '%s\n' "$COMMENT_MARKER"
+            if [ "$total" -eq 0 ]; then
+              printf '### Semgrep: nenhum finding no código novo deste PR\n'
+            else
+              printf '### Semgrep: %s finding(s) no código novo deste PR\n\n' "$total"
+              printf '`ERROR` %s &middot; `WARNING` %s &middot; `INFO` %s\n\n' "$errors" "$warnings" "$infos"
+              jq -r --argjson max "$MAX_FINDINGS" '
+                def rank:
+                  if   .extra.severity == "ERROR"   then 0
+                  elif .extra.severity == "WARNING" then 1
+                  elif .extra.severity == "INFO"    then 2
+                  else 3 end;
+                def icon:
+                  if   .extra.severity == "ERROR"   then "ERROR"
+                  elif .extra.severity == "WARNING" then "WARNING"
+                  else "INFO" end;
+                [.results[]]
+                | sort_by(rank)
+                | .[0:$max]
+                | map(
+                    "- **[" + icon + "]** `" + .path + ":" + (.start.line | tostring) + "`"
+                    + " — regra `" + (.check_id | split(".") | last) + "`\n  "
+                    + ((.extra.message // "") | gsub("[\r\n]+"; " ") | .[0:400])
+                  )
+                | join("\n")
+              ' semgrep.json
+              if [ "$total" -gt "$MAX_FINDINGS" ]; then
+                printf '\n\n_%s finding(s) omitido(s) além dos %s listados; o log do job traz a lista completa._\n' \
+                  "$((total - MAX_FINDINGS))" "$MAX_FINDINGS"
+              fi
+            fi
+            printf '\n<sub>Varredura diff-only, baseline `%s`. Só código introduzido por este PR é avaliado. Reprova em severidade `%s`.</sub>\n' \
+              "${BASELINE_SHA:0:7}" "$FAIL_ON"
+          } > comment.md
+
+      - name: Resumo no job
+        if: always()
+        run: |
+          set -euo pipefail
+          [ -s comment.md ] && cat comment.md >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Publicar comentário no PR
+        # Em PR vindo de fork o GITHUB_TOKEN é read-only; nesse caso o relatório fica
+        # apenas no resumo do job, publicado no passo anterior.
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # O corpo vai por arquivo, nunca interpolado no shell: mensagens de regra e
+          # nomes de arquivo do repositório não devem virar comando.
+          jq -n --rawfile body comment.md '{body: $body}' > payload.json
+
+          comment_id=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+            | jq -s -r --arg marker "$COMMENT_MARKER" '
+                [ .[][]
+                  | select(.user.login == "github-actions[bot]")
+                  | select(.body | startswith($marker))
+                  | .id
+                ] | last // empty')
+
+          if [ -n "$comment_id" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$comment_id" --input payload.json > /dev/null
+          else
+            gh api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" --input payload.json > /dev/null
+          fi
+
+      - name: Guardar evidência da varredura
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: semgrep-findings-pr-${{ github.event.pull_request.number }}
+          path: semgrep.json
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Avaliar severidade
+        run: |
+          set -euo pipefail
+          errors=$(jq '[.results[] | select(.extra.severity == "ERROR")] | length' semgrep.json)
+          warnings=$(jq '[.results[] | select(.extra.severity == "WARNING")] | length' semgrep.json)
+          case "$FAIL_ON" in
+            NONE)    echo "Gate desativado (fail-on-severity=NONE)"; exit 0 ;;
+            WARNING) blocking=$((errors + warnings)) ;;
+            ERROR)   blocking=$errors ;;
+          esac
+          if [ "$blocking" -gt 0 ]; then
+            echo "::error::$blocking finding(s) de severidade >= $FAIL_ON no código novo deste PR"
+            exit 1
+          fi
+          echo "Nenhum finding bloqueante."
