@@ -28,7 +28,7 @@ on:
         type: string
         default: divida-semgrep
       max-findings-in-issue:
-        description: Máximo de findings ERROR listados no corpo da issue.
+        description: Máximo de findings de faixa alta listados no corpo da issue.
         type: number
         default: 50
 
@@ -44,6 +44,10 @@ jobs:
       cancel-in-progress: false
     env:
       ISSUE_MARKER: '<!-- planisa-security-full-scan:semgrep -->'
+      # O semgrep emite tanto as severidades legadas (ERROR/WARNING/INFO) quanto as de
+      # escala CVSS (CRITICAL/HIGH/MEDIUM/LOW). Contar só as legadas fazia a soma das
+      # faixas não fechar com o total. Severidade não prevista cai em "desconhecida".
+      TIER_JQ: 'def tier: (.extra.severity // "" | ascii_upcase) as $s | if (["CRITICAL","HIGH","ERROR"] | index($s)) then "alta" elif (["MEDIUM","WARNING"] | index($s)) then "media" elif (["LOW","INFO"] | index($s)) then "baixa" else "desconhecida" end;'
       SEMGREP_CONFIG: ${{ inputs.semgrep-config }}
       SEMGREP_VERSION: ${{ inputs.semgrep-version }}
       EXCLUDE: ${{ inputs.exclude }}
@@ -110,15 +114,37 @@ jobs:
 
           echo "Findings (lista completa):"
           jq -r '.results[] | "  [\(.extra.severity)] \(.path):\(.start.line) \(.check_id)"' semgrep.json
-          echo "Total: $(jq '.results | length' semgrep.json)"
+
+          # Substituição de comando, não process substitution: com set -e ativo, falha
+          # do jq quebra o step. Com `read < <(...)` as contagens viriam vazias, o gate
+          # leria zero e liberaria o merge — falha aberta inaceitável num gate.
+          contagens=$(jq -r "$TIER_JQ"'
+            [.results[] | tier] | group_by(.) | map({(.[0]): length}) | add // {}
+            | "\(.alta // 0) \(.media // 0) \(.baixa // 0) \(.desconhecida // 0)"
+          ' semgrep.json)
+          read -r alta media baixa desconhecida <<< "$contagens"
+          for valor in "$alta" "$media" "$baixa" "$desconhecida"; do
+            [[ "$valor" =~ ^[0-9]+$ ]] \
+              || { echo "::error::falha ao classificar severidades (contagens: $contagens)"; exit 1; }
+          done
+          {
+            echo "SEV_ALTA=$alta"
+            echo "SEV_MEDIA=$media"
+            echo "SEV_BAIXA=$baixa"
+            echo "SEV_DESCONHECIDA=$desconhecida"
+            echo "SEV_TOTAL=$(jq '.results | length' semgrep.json)"
+          } >> "$GITHUB_ENV"
+          echo "Faixas: alta=$alta media=$media baixa=$baixa desconhecida=$desconhecida"
+
+          if [ "$desconhecida" -gt 0 ]; then
+            valores=$(jq -r "$TIER_JQ"'[.results[] | select(tier == "desconhecida") | .extra.severity] | unique | join(", ")' semgrep.json)
+            echo "::warning::Severidade não mapeada encontrada ($valores); contada como faixa média. Atualize o TIER_JQ do workflow."
+          fi
 
       - name: Montar corpo da issue
         run: |
           set -euo pipefail
-          total=$(jq '.results | length' semgrep.json)
-          errors=$(jq '[.results[] | select(.extra.severity == "ERROR")] | length' semgrep.json)
-          warnings=$(jq '[.results[] | select(.extra.severity == "WARNING")] | length' semgrep.json)
-          infos=$(jq '[.results[] | select(.extra.severity == "INFO")] | length' semgrep.json)
+          total="$SEV_TOTAL"
           echo "TOTAL_FINDINGS=$total" >> "$GITHUB_ENV"
 
           {
@@ -126,8 +152,13 @@ jobs:
             printf 'Varredura completa do repositório em `%s`, commit `%s`.\n' \
               "$(date -u '+%Y-%m-%d %H:%M UTC')" "${GITHUB_SHA:0:7}"
             printf 'Esta issue é reescrita a cada execução — o conteúdo reflete sempre a última varredura.\n\n'
-            printf '**Total %s** — `ERROR` %s &middot; `WARNING` %s &middot; `INFO` %s\n\n' \
-              "$total" "$errors" "$warnings" "$infos"
+            printf '**Total %s** — faixa alta %s &middot; média %s &middot; baixa %s' \
+              "$total" "$SEV_ALTA" "$SEV_MEDIA" "$SEV_BAIXA"
+            if [ "$SEV_DESCONHECIDA" -gt 0 ]; then
+              printf ' &middot; severidade não mapeada %s' "$SEV_DESCONHECIDA"
+            fi
+            printf '\n\n'
+            printf 'Faixa alta reúne `CRITICAL`, `HIGH` e `ERROR`; média reúne `MEDIUM` e `WARNING`; baixa reúne `LOW` e `INFO`.\n\n'
 
             if [ "$total" -gt 0 ]; then
               printf '### Regras mais recorrentes\n\n'
@@ -144,19 +175,20 @@ jobs:
               printf '\n'
             fi
 
-            if [ "$errors" -gt 0 ]; then
-              printf '\n### Findings de severidade ERROR\n\n'
-              jq -r --argjson max "$MAX_FINDINGS" '
-                [.results[] | select(.extra.severity == "ERROR")]
+            if [ "$SEV_ALTA" -gt 0 ]; then
+              printf '\n### Findings de faixa alta\n\n'
+              jq -r --argjson max "$MAX_FINDINGS" "$TIER_JQ"'
+                [.results[] | select(tier == "alta")]
                 | .[0:$max]
-                | map("- `" + .path + ":" + (.start.line | tostring) + "` — `"
+                | map("- **[" + (.extra.severity // "?") + "]** `" + .path + ":"
+                      + (.start.line | tostring) + "` — `"
                       + (.check_id | split(".") | last) + "`")
                 | join("\n")
               ' semgrep.json
               printf '\n'
-              if [ "$errors" -gt "$MAX_FINDINGS" ]; then
-                printf '\n_%s finding(s) ERROR omitido(s) além dos %s listados; o log do job e o artifact `semgrep-full-scan` trazem a lista completa._\n' \
-                  "$((errors - MAX_FINDINGS))" "$MAX_FINDINGS"
+              if [ "$SEV_ALTA" -gt "$MAX_FINDINGS" ]; then
+                printf '\n_%s finding(s) de faixa alta omitido(s) além dos %s listados; o log do job e o artifact `semgrep-full-scan` trazem a lista completa._\n' \
+                  "$((SEV_ALTA - MAX_FINDINGS))" "$MAX_FINDINGS"
               fi
             fi
 
