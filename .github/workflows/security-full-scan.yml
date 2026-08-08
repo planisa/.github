@@ -163,16 +163,30 @@ jobs:
             printf '\n<sub>Varredura informativa: não reprova PR nem bloqueia merge. O gate de código novo é o check `semgrep / Semgrep (código novo do PR)`.</sub>\n'
           } > issue.md
 
+      - name: Resumo no job
+        if: always()
+        run: |
+          set -euo pipefail
+          [ -s issue.md ] && cat issue.md >> "$GITHUB_STEP_SUMMARY" || true
+
       - name: Criar ou atualizar issue de acompanhamento
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          # Boa parte dos repositórios da organização tem Issues desabilitada; nesses
+          # casos a API responde erro e o step quebraria. O relatório já está no resumo
+          # do job e no artifact, então aqui é só avisar e sair.
+          if [ "$(gh api "repos/$GH_REPO" --jq '.has_issues')" != "true" ]; then
+            echo "::warning::Issues desabilitada em $GH_REPO. Relatório disponível no resumo do job e no artifact."
+            exit 0
+          fi
+
           gh label create "$ISSUE_LABEL" --color B60205 \
             --description "Dívida de segurança apontada pela varredura completa do Semgrep" 2>/dev/null || true
 
-          number=$(gh issue list --label "$ISSUE_LABEL" --state open --limit 1 --json number --jq '.[0].number // empty')
+          number=$(gh issue list --label "$ISSUE_LABEL" --state open --limit 1 --json number --jq '.[0].number // empty' 2>/dev/null || true)
 
           if [ "$TOTAL_FINDINGS" -eq 0 ]; then
             if [ -n "$number" ]; then
